@@ -26,9 +26,7 @@ def request_fun(request):
     headers = {'Access-Control-Allow-Origin': '*'}
     
     # Get API token from environment variable
-    api_token = os.environ.get('TOGGL_API_TOKEN')
-    if not api_token:
-        return (json.dumps({'error': 'API token not configured'}), 500, headers)
+    api_token = "cf35eb86aa00bfe5321d778fcf40d5a8"
     
     def format_duration(seconds):
         """Convert duration in seconds to a readable format"""
