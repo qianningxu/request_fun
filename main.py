@@ -2,16 +2,15 @@ import functions_framework
 import requests
 import json
 from datetime import datetime, timedelta
-import os
+import pytz
 
 @functions_framework.http
 def request_fun(request):
-    """HTTP Cloud Function to retrieve Toggl time entries.
+    """HTTP Cloud Function to retrieve Toggl time entries and validate play time.
     Args:
-        request (flask.Request): The request object.
+        request (flask.Request): The request object with 'requested_play_time' parameter.
     Returns:
-        The response text, or any set of values that can be turned into a
-        Response object using `make_response`.
+        The response text with play time decision.
     """
     # Enable CORS for browser-based requests
     if request.method == 'OPTIONS':
@@ -25,31 +24,80 @@ def request_fun(request):
     
     headers = {'Access-Control-Allow-Origin': '*'}
     
-    # Get API token from environment variable
+    # Get the requested_play_time parameter
+    # Check if it's in query parameters
+    requested_play_time = request.args.get('requested_play_time')
+    
+    # If not in query params, check if it's in JSON body
+    if not requested_play_time and request.is_json:
+        request_json = request.get_json(silent=True)
+        if request_json and 'requested_play_time' in request_json:
+            requested_play_time = request_json['requested_play_time']
+    
+    # Validate requested_play_time
+    try:
+        if not requested_play_time:
+            return (json.dumps({'error': 'requested_play_time parameter is required'}), 400, headers)
+        requested_play_time = int(requested_play_time)
+    except ValueError:
+        return (json.dumps({'error': 'requested_play_time must be a number'}), 400, headers)
+    
+    # API credentials
     api_token = "cf35eb86aa00bfe5321d778fcf40d5a8"
     
-    def format_duration(seconds):
-        """Convert duration in seconds to a readable format"""
+    # Helper function to convert seconds to minutes
+    def seconds_to_minutes(seconds):
         if seconds < 0:  # Running timer has negative duration
-            return "In progress"
+            return 0
+        return seconds / 60
+    
+    # Helper function to check if a date is today after 4am
+    def is_today_after_4am(timestamp):
+        # Get current timezone-aware datetime
+        now = datetime.now(pytz.UTC)
         
-        # Create a timedelta and format it
-        duration = timedelta(seconds=seconds)
-        hours, remainder = divmod(duration.seconds, 3600)
-        minutes, seconds = divmod(remainder, 60)
+        # Create today at 4am
+        today_4am = datetime.combine(now.date(), datetime.min.time())
+        today_4am = today_4am.replace(hour=4, tzinfo=pytz.UTC)
         
-        return f"{hours}h {minutes}m {seconds}s"
-
+        # Convert timestamp to datetime object
+        try:
+            entry_time = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        except ValueError:
+            return False
+            
+        return entry_time >= today_4am
+    
+    # Helper function to check if a date is from Monday of this week
+    def is_from_monday_this_week(timestamp):
+        # Get current timezone-aware datetime
+        now = datetime.now(pytz.UTC)
+        
+        # Calculate Monday of current week
+        days_since_monday = now.weekday()
+        monday = now - timedelta(days=days_since_monday)
+        monday = datetime.combine(monday.date(), datetime.min.time())
+        monday = monday.replace(tzinfo=pytz.UTC)
+        
+        # Convert timestamp to datetime object
+        try:
+            entry_time = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        except ValueError:
+            return False
+            
+        return entry_time >= monday
+    
     # API endpoint for time entries
     base_url = "https://api.track.toggl.com/api/v9"
     time_entries_endpoint = f"{base_url}/me/time_entries"
 
     try:
-        # Make the API request
+        # Make the API request to get time entries
+        # Get more entries to ensure we have enough data for the week
         response = requests.get(
             time_entries_endpoint,
-            auth=(api_token, "api_token"),  # Using basic auth with API token
-            params={"limit": 10}
+            auth=(api_token, "api_token"),
+            params={"limit": 100}  # Increased limit to get more entries
         )
         
         # Check if the request was successful
@@ -59,46 +107,70 @@ def request_fun(request):
             
             if not time_entries:
                 return (json.dumps({'message': 'No time entries found'}), 200, headers)
+            
+            # STEP 1: Process today's focus time entries
+            today_focus_entries = [
+                entry for entry in time_entries 
+                if entry.get("start") and is_today_after_4am(entry["start"]) and 
+                any(tag == "专注" for tag in entry.get("tags", []))
+            ]
+            
+            # Calculate total focus duration today in minutes
+            today_focus_minutes = sum(
+                seconds_to_minutes(entry["duration"]) 
+                for entry in today_focus_entries 
+                if "duration" in entry and entry["duration"] is not None
+            )
+            
+            # Check if there's enough focus time today
+            if today_focus_minutes < 90:
+                return (json.dumps({
+                    'result': 'denied',
+                    'message': 'Not enough focus has been done today to earn you the right to play',
+                    'today_focus_minutes': today_focus_minutes
+                }), 200, headers)
+            
+            # STEP 2: Process this week's entries
+            weekly_entries = [
+                entry for entry in time_entries 
+                if entry.get("start") and is_from_monday_this_week(entry["start"])
+            ]
+            
+            # Calculate total focus and play time for the week
+            total_focus_minutes = sum(
+                seconds_to_minutes(entry["duration"]) 
+                for entry in weekly_entries 
+                if "duration" in entry and entry["duration"] is not None and
+                any(tag == "专注" for tag in entry.get("tags", []))
+            )
+            
+            total_play_minutes = sum(
+                seconds_to_minutes(entry["duration"]) 
+                for entry in weekly_entries 
+                if "duration" in entry and entry["duration"] is not None and
+                any(tag == "娱乐" for tag in entry.get("tags", []))
+            )
+            
+            # Apply the play time rule
+            if (total_play_minutes + requested_play_time) > (total_focus_minutes * 0.5):
+                return (json.dumps({
+                    'result': 'denied',
+                    'message': 'Too much play time this week',
+                    'total_focus_minutes': total_focus_minutes,
+                    'total_play_minutes': total_play_minutes,
+                    'play_time_limit': total_focus_minutes * 0.5,
+                    'remaining_play_time': max(0, (total_focus_minutes * 0.5) - total_play_minutes)
+                }), 200, headers)
             else:
-                # Format the time entries for response
-                formatted_entries = []
+                return (json.dumps({
+                    'result': 'permitted',
+                    'message': f'A play time of {requested_play_time} minutes is permitted',
+                    'total_focus_minutes': total_focus_minutes,
+                    'total_play_minutes': total_play_minutes,
+                    'play_time_limit': total_focus_minutes * 0.5,
+                    'remaining_play_time': (total_focus_minutes * 0.5) - total_play_minutes
+                }), 200, headers)
                 
-                for entry in time_entries:
-                    # Convert timestamps to readable format
-                    start_time = "Unknown"
-                    if "start" in entry and entry["start"]:
-                        try:
-                            start_time = datetime.fromisoformat(entry["start"].replace("Z", "+00:00"))
-                            start_time = start_time.strftime("%Y-%m-%d %H:%M:%S")
-                        except ValueError:
-                            pass
-                    
-                    # Handle entries that are still running (no stop time)
-                    stop_time = "Not stopped"
-                    if "stop" in entry and entry["stop"]:
-                        try:
-                            stop_time = datetime.fromisoformat(entry["stop"].replace("Z", "+00:00"))
-                            stop_time = stop_time.strftime("%Y-%m-%d %H:%M:%S")
-                        except ValueError:
-                            pass
-                    
-                    # Format duration
-                    duration = "Unknown"
-                    if "duration" in entry:
-                        duration = format_duration(entry["duration"])
-                    
-                    # Format entry
-                    formatted_entry = {
-                        'description': entry.get('description', 'No description'),
-                        'project_id': entry.get('project_id', 'No project'),
-                        'start': start_time,
-                        'stop': stop_time,
-                        'duration': duration
-                    }
-                    
-                    formatted_entries.append(formatted_entry)
-                
-                return (json.dumps({'entries': formatted_entries}), 200, headers)
         else:
             return (json.dumps({'error': f'Error accessing Toggl API: {response.status_code}'}), 500, headers)
 
