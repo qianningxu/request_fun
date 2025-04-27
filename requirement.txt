@@ -1,0 +1,4 @@
+requests
+Flask>=3.0
+pytz
+gunicorn
