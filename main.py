@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 import os
 
 @functions_framework.http
-def get_toggl_entries(request):
+def request_rn(request):
     """HTTP Cloud Function to retrieve Toggl time entries.
     Args:
         request (flask.Request): The request object.
